@@ -19,8 +19,9 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Union, cast
+from typing import TYPE_CHECKING, Final, Union, cast
 
+from pydantic import ConfigDict, TypeAdapter, ValidationError, with_config
 from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 import litellm
@@ -74,6 +75,73 @@ if TYPE_CHECKING:
     )
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
     from litellm.types.proxy.auth.user_api_key_auth import UserAPIKeyAuth
+
+
+@with_config(ConfigDict(extra="ignore"))
+class _ReturnedToolCallFunction(TypedDict, total=False):
+    name: ReadOnly[str]
+    arguments: ReadOnly[str]
+
+
+@with_config(ConfigDict(extra="allow"))
+class _ReturnedToolCall(TypedDict, total=False):
+    function: ReadOnly[_ReturnedToolCallFunction]
+
+
+class _WritableToolCall(TypedDict, total=False):
+    function: ReadOnly[dict[str, object]]  # mutable-ok: the request's own tool_call dict, rewritten in place
+
+
+_RETURNED_TOOL_CALLS: Final = TypeAdapter(tuple[_ReturnedToolCall, ...])
+_MESSAGE_TOOL_CALLS: Final = TypeAdapter(tuple[object, ...])
+
+
+def _message_tool_calls(message: Mapping[str, object]) -> tuple[object, ...]:
+    """The message's own tool_call objects, so a write-back lands on the request itself."""
+    try:
+        return _MESSAGE_TOOL_CALLS.validate_python(message.get("tool_calls"))
+    except ValidationError:
+        return ()
+
+
+def _usable_returned_tool_calls(
+    returned_tool_calls: object, scanned_count: int, guardrail: "CustomGuardrail"
+) -> tuple[_ReturnedToolCall, ...] | None:
+    """The returned ``tool_calls`` when they line up one to one with the scanned calls, else ``None``,
+    as a list of another length cannot be matched to the calls by position."""
+    try:
+        rows: Final = _RETURNED_TOOL_CALLS.validate_python(returned_tool_calls)
+    except ValidationError:
+        return None
+    if len(rows) == scanned_count:
+        return rows
+    verbose_proxy_logger.warning(
+        "OpenAI Chat Completions: guardrail %s returned %d tool calls for the %d scanned, leaving them unchanged",
+        guardrail.guardrail_name,
+        len(rows),
+        scanned_count,
+    )
+    return None
+
+
+def _scanned_tool_call_rows(tool_calls_to_check: Sequence[Mapping[str, object]]) -> tuple[_ReturnedToolCall, ...]:
+    """The scanned calls as the guardrail left them, which carry its in-place rewrites when it returned nothing."""
+    try:
+        return _RETURNED_TOOL_CALLS.validate_python(tool_calls_to_check)
+    except ValidationError:
+        return ()
+
+
+def _write_back_tool_call_function(tool_call: object, guardrailed_tool_call: _ReturnedToolCall) -> None:
+    """Keep the request's own tool_call object, with its ``id`` and ``type``, and take only the
+    ``function`` name and arguments the guardrail handed back."""
+    guardrailed_function: Final = guardrailed_tool_call.get("function")
+    if guardrailed_function is None or not isinstance(tool_call, dict):
+        return
+    function: Final = cast(_WritableToolCall, tool_call).get("function")  # cast-ok: a message tool_call dict
+    if not isinstance(function, dict):
+        return
+    function.update({key: value for key, value in guardrailed_function.items() if key in ("name", "arguments")})
 
 
 class OpenAIChatCompletionsHandler(BaseTranslation):
@@ -173,7 +241,9 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             )
 
             guardrailed_texts: Final = guardrailed_inputs.get("texts", [])
-            guardrailed_tool_calls: Final = guardrailed_inputs.get("tool_calls", [])
+            guardrailed_tool_calls: Final = _usable_returned_tool_calls(
+                guardrailed_inputs.get("tool_calls"), len(tool_calls_to_check), guardrail_to_apply
+            )
             guardrailed_tools: Final = guardrailed_inputs.get("tools")
             if guardrailed_tools is not None:
                 data["tools"] = (
@@ -212,7 +282,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                     )
 
                 # Step 4: Apply guardrailed tool calls back to messages
-                if guardrailed_tool_calls:
+                if guardrailed_tool_calls is not None:
                     await self._apply_guardrail_responses_to_input_tool_calls(
                         messages=messages,
                         tool_calls=guardrailed_tool_calls,
@@ -366,7 +436,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
     async def _apply_guardrail_responses_to_input_tool_calls(
         self,
         messages: Sequence[Mapping[str, object]],
-        tool_calls: Sequence[Mapping[str, object]],
+        tool_calls: Sequence[_ReturnedToolCall],
         task_mappings: list[tuple[int, int]],
     ) -> None:
         """
@@ -378,13 +448,10 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         Override this method to customize how tool call responses are applied.
         """
         for task_idx, (msg_idx, tool_call_idx) in enumerate(task_mappings):
-            if task_idx < len(tool_calls):
-                guardrailed_tool_call = tool_calls[task_idx]
-                message_tool_calls = messages[msg_idx].get("tool_calls", None)
-                if message_tool_calls is not None and isinstance(message_tool_calls, list):
-                    if tool_call_idx < len(message_tool_calls):
-                        # Replace the tool call with the guardrailed version
-                        message_tool_calls[tool_call_idx] = guardrailed_tool_call
+            message_tool_calls = _message_tool_calls(messages[msg_idx])
+            if task_idx >= len(tool_calls) or tool_call_idx >= len(message_tool_calls):
+                continue
+            _write_back_tool_call_function(message_tool_calls[tool_call_idx], tool_calls[task_idx])
 
     async def process_output_response(
         self,
@@ -466,12 +533,9 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             )
 
             guardrailed_texts: Final = guardrailed_inputs.get("texts", [])
-            returned_tool_calls: Final = guardrailed_inputs.get("tool_calls")
-            guardrailed_tool_calls: Final[list[dict[str, object]]] = (
-                cast(list[dict[str, object]], returned_tool_calls)
-                if isinstance(returned_tool_calls, list) and len(returned_tool_calls) == len(tool_calls_to_check)
-                else tool_calls_to_check
-            )
+            guardrailed_tool_calls: Final = _usable_returned_tool_calls(
+                guardrailed_inputs.get("tool_calls"), len(tool_calls_to_check), guardrail_to_apply
+            ) or _scanned_tool_call_rows(tool_calls_to_check)
 
             # Step 3: Map guardrail responses back to original response structure
             if guardrailed_texts and texts_to_check:
@@ -1064,7 +1128,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
     async def _apply_guardrail_responses_to_output_tool_calls(
         self,
         response: "ModelResponse",
-        tool_calls: list[dict[str, Any]],
+        tool_calls: Sequence[_ReturnedToolCall],
         task_mappings: list[tuple[int, int]],
     ) -> None:
         """
@@ -1087,8 +1151,8 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
                         # Update the tool call with guardrailed version
                         existing_tool_call = choice_tool_calls[tool_call_idx]
                         # Update object attributes (output responses always have typed objects)
-                        if "function" in guardrailed_tool_call:
-                            func_dict = guardrailed_tool_call["function"]
+                        func_dict = guardrailed_tool_call.get("function")
+                        if func_dict is not None:
                             if "arguments" in func_dict:
                                 existing_tool_call.function.arguments = func_dict["arguments"]
                             if "name" in func_dict:

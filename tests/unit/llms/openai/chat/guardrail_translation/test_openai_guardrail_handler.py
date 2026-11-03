@@ -907,6 +907,75 @@ class TestOpenAIChatCompletionsHandlerToolCallsOutput:
         assert tool_calls[1].function.arguments == second_args
 
 
+class MockFunctionOnlyToolCallGuardrail(CustomGuardrail):
+    """Mock guardrail that returns each tool call as only its rewritten function, the way a
+    scrubber that does not echo id and type does."""
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional[Any] = None,
+    ) -> GenericGuardrailAPIInputs:
+        return GenericGuardrailAPIInputs(
+            texts=inputs.get("texts", []),
+            tool_calls=[
+                {"function": {"name": tool_call["function"]["name"], "arguments": json.dumps({"email": "[EMAIL]"})}}
+                for tool_call in inputs.get("tool_calls", [])
+            ],
+        )
+
+
+class TestOpenAIChatCompletionsHandlerToolCallsInputWriteBack:
+    @staticmethod
+    def _assistant_tool_call_turn(*arguments: str) -> dict[str, Any]:
+        return {
+            "messages": [
+                {"role": "user", "content": "email them"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call_{idx}",
+                            "type": "function",
+                            "function": {"name": "send_email", "arguments": call_arguments},
+                        }
+                        for idx, call_arguments in enumerate(arguments, start=1)
+                    ],
+                },
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_returned_function_only_rows_keep_the_request_tool_call_id_and_type(self):
+        handler = OpenAIChatCompletionsHandler()
+        data = self._assistant_tool_call_turn(json.dumps({"email": "john@example.com"}))
+
+        await handler.process_input_messages(data, MockFunctionOnlyToolCallGuardrail(guardrail_name="test"))
+
+        assert data["messages"][1]["tool_calls"] == [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "send_email", "arguments": json.dumps({"email": "[EMAIL]"})},
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_returned_list_of_another_length_leaves_the_request_tool_calls_unchanged(self):
+        handler = OpenAIChatCompletionsHandler()
+        first_args = json.dumps({"email": "a@example.com"})
+        second_args = json.dumps({"email": "b@example.com"})
+        data = self._assistant_tool_call_turn(first_args, second_args)
+        original = json.loads(json.dumps(data))
+
+        await handler.process_input_messages(data, MockMisalignedToolCallGuardrail(guardrail_name="test"))
+
+        assert data["messages"] == original["messages"], "one returned call for two scanned cannot be placed"
+
+
 class MockPassThroughGuardrail(CustomGuardrail):
     """Mock guardrail that passes through without blocking - for testing streaming fallback behavior"""
 
