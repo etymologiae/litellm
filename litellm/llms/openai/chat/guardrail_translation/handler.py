@@ -393,6 +393,8 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         litellm_logging_obj: "LiteLLMLoggingObj | None" = None,
         user_api_key_dict: "UserAPIKeyAuth | None" = None,
         request_data: dict | None = None,
+        *,
+        deliver_ended_stream_rewrites: bool = False,
     ) -> ModelResponse:
         """
         Process output response by applying guardrails to text content.
@@ -467,6 +469,18 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
 
             guardrailed_texts: Final = guardrailed_inputs.get("texts", [])
             returned_tool_calls: Final = guardrailed_inputs.get("tool_calls")
+            if (
+                deliver_ended_stream_rewrites
+                and isinstance(returned_tool_calls, list)
+                and len(returned_tool_calls) != len(tool_calls_to_check)
+            ):
+                from litellm.proxy.policy_engine.pipeline_executor import UndeliverableStreamRewrite
+
+                raise UndeliverableStreamRewrite(
+                    guardrail_to_apply.guardrail_name or "unknown",
+                    f"the guardrail returned {len(returned_tool_calls)} tool calls for a stream that carried "
+                    f"{len(tool_calls_to_check)}",
+                )
             guardrailed_tool_calls: Final[list[dict[str, object]]] = (
                 cast(list[dict[str, object]], returned_tool_calls)
                 if isinstance(returned_tool_calls, list) and len(returned_tool_calls) == len(tool_calls_to_check)
@@ -667,6 +681,7 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
             litellm_logging_obj=litellm_logging_obj,
             user_api_key_dict=user_api_key_dict,
             request_data=request_data,
+            deliver_ended_stream_rewrites=deliver_ended_stream_rewrites,
         )
         if not deliver_ended_stream_rewrites:
             return
